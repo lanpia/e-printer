@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"runtime"
 
 	"eprinter/internal/engine"
 	"eprinter/internal/vprinter"
@@ -16,16 +16,23 @@ import (
 
 // guiMain 은 walk 기반 데스크톱 UI 를 띄운다.
 func guiMain() {
+	// walk UI 는 단일 OS 스레드에 고정되어야 한다(로딩창과 본 창이 같은 스레드여야
+	// Synchronize/메시지 전달이 올바르게 동작한다).
+	runtime.LockOSThread()
+
 	eng := resolveEngines()
-	printers := loadPrinters()
+
+	// 가상 프린터를 먼저 설치한 뒤(로딩창 표시) 본 GUI 를 띄운다.
+	admin := vprinter.IsAdmin()
+	var installErr error
+	if admin {
+		installErr = runInstallSplash()
+	}
 
 	var mw *walk.MainWindow
-	var inEdit, outEdit *walk.LineEdit
-	var printerCb *walk.ComboBox
 	var status *walk.Label
 	var vpLabel *walk.Label
 	var autoEdit *walk.LineEdit
-	var logBox *walk.TextEdit
 
 	setStatus := func(format string, a ...interface{}) {
 		if status != nil {
@@ -39,21 +46,12 @@ func guiMain() {
 	if err := (MainWindow{
 		AssignTo: &mw,
 		Title:    "나효미의 프린터 — PDF 변환 / 인쇄",
-		MinSize:  Size{Width: 560, Height: 320},
+		MinSize:  Size{Width: 440, Height: 150},
+		Size:     Size{Width: 520, Height: 200},
 		Layout:   VBox{},
 		Children: []Widget{
 			GroupBox{
-				Title:  "백엔드 엔진 (실행파일에 내장됨)",
-				Layout: Grid{Columns: 2},
-				Children: []Widget{
-					Label{Text: "Ghostscript:"},
-					Label{Text: pathOrMissing(eng.Ghostscript)},
-					Label{Text: "GhostPCL:"},
-					Label{Text: pathOrMissing(eng.GhostPCL)},
-				},
-			},
-			GroupBox{
-				Title:  "가상 프린터 (다른 프로그램에서 \"eprinter\"로 인쇄 → 자동 PDF 저장)",
+				Title:  "가상 프린터",
 				Layout: Grid{Columns: 3},
 				Children: []Widget{
 					Label{Text: "상태:"},
@@ -73,75 +71,12 @@ func guiMain() {
 				},
 			},
 			GroupBox{
-				Title:  "프린터",
-				Layout: HBox{},
+				Title:  "백엔드 엔진 (내장)",
+				Layout: VBox{},
 				Children: []Widget{
-					Label{Text: "설치된 프린터:"},
-					ComboBox{
-						AssignTo:     &printerCb,
-						Model:        printers,
-						CurrentIndex: 0,
-						MinSize:      Size{Width: 280},
-					},
-					PushButton{
-						Text: "새로고침",
-						OnClicked: func() {
-							printerCb.SetModel(loadPrinters())
-							setStatus("프린터 목록을 새로고침했습니다.")
-						},
-					},
+					Label{Text: engineStatus(eng)},
 				},
 			},
-			GroupBox{
-				Title:  "입력 문서 (PDF / PostScript / PCL / PCL-XL)",
-				Layout: HBox{},
-				Children: []Widget{
-					LineEdit{AssignTo: &inEdit, ReadOnly: true},
-					PushButton{
-						Text: "찾아보기…",
-						OnClicked: func() {
-							if p := openDialog(mw); p != "" {
-								inEdit.SetText(p)
-								if outEdit.Text() == "" {
-									outEdit.SetText(suggestPDF(p))
-								}
-								setStatus("입력: %s", filepath.Base(p))
-							}
-						},
-					},
-				},
-			},
-			GroupBox{
-				Title:  "PDF 저장 위치 / 파일명",
-				Layout: HBox{},
-				Children: []Widget{
-					LineEdit{AssignTo: &outEdit},
-					PushButton{
-						Text: "저장 위치…",
-						OnClicked: func() {
-							if p := saveDialog(mw, outEdit.Text()); p != "" {
-								outEdit.SetText(p)
-							}
-						},
-					},
-				},
-			},
-			Composite{
-				Layout: HBox{},
-				Children: []Widget{
-					PushButton{
-						Text:      "PDF로 변환",
-						OnClicked: func() { doConvert(mw, eng, inEdit.Text(), outEdit.Text(), setStatus) },
-					},
-					PushButton{
-						Text:      "선택한 프린터로 인쇄",
-						OnClicked: func() { doPrint(mw, eng, inEdit.Text(), printerCb.Text(), setStatus) },
-					},
-					HSpacer{},
-				},
-			},
-			Label{Text: "변환 기록:"},
-			TextEdit{AssignTo: &logBox, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}},
 			Label{AssignTo: &status, Text: "준비됨."},
 		},
 	}).Create(); err != nil {
@@ -149,50 +84,90 @@ func guiMain() {
 		os.Exit(1)
 	}
 
-	// 가상 프린터 라이프사이클(a안): 실행 시 설치 / 종료 시 삭제.
-	startVirtualPrinter(mw, eng, watcher, vpLabel, logBox, setStatus)
+	// 가상 프린터 상태 표시 + 스풀 감시 시작 + 종료 시 정리(a안).
+	// 설치 자체는 본 창 생성 전에 runInstallSplash 에서 이미 끝났다.
+	appendLog := func(msg string) {
+		mw.Synchronize(func() {
+			setStatus("%s", msg)
+		})
+	}
+	switch {
+	case !admin:
+		vpLabel.SetText("비활성 — 관리자 권한이 없어 가상 프린터를 설치하지 못했습니다")
+	case installErr != nil:
+		vpLabel.SetText("설치 실패")
+		_ = vprinter.Remove() // 포트만 생기고 프린터 추가가 실패한 부분 설치 잔여물 정리(idempotent)
+		walk.MsgBox(mw, "가상 프린터 설치 실패", installErr.Error(), walk.MsgBoxIconWarning)
+	default:
+		vpLabel.SetText(fmt.Sprintf("활성 — \"%s\" 로 인쇄하면 자동으로 PDF 저장됩니다", vprinter.PrinterName))
+		watcher.Convert = func(in, out string) error {
+			return eng.Convert(context.Background(), engine.ConvertOptions{
+				Input: in, Output: out, Kind: engine.OutPDF,
+			})
+		}
+		watcher.OnEvent = appendLog
+		go watcher.Run()
+		mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+			watcher.Stop()
+			_ = vprinter.Remove()
+		})
+	}
 
 	mw.Run()
 }
 
-// startVirtualPrinter 는 가상 프린터를 설치하고 스풀 감시를 시작한다(a안).
-// 창이 닫힐 때 프린터를 제거하도록 Closing 핸들러를 건다.
-func startVirtualPrinter(mw *walk.MainWindow, eng engine.Engines, watcher *vprinter.Watcher,
-	vpLabel *walk.Label, logBox *walk.TextEdit, setStatus func(string, ...interface{})) {
-
-	appendLog := func(msg string) {
-		mw.Synchronize(func() {
-			logBox.AppendText(msg + "\r\n")
-			setStatus(msg)
-		})
+// runInstallSplash 는 가상 프린터를 설치하는 동안 로딩창을 띄우고,
+// 설치가 끝나면 로딩창을 닫은 뒤 설치 결과(err)를 반환한다. (관리자 권한에서만 호출)
+//
+// 설치(PowerShell)는 별도 고루틴에서 돌리고, 로딩창의 메시지 루프(sp.Run)가
+// 그동안 화면을 그려 "멈춘 창"처럼 보이지 않게 한다. walk 의 MainWindow 는
+// 닫혀도 PostQuitMessage 를 보내지 않으므로, 이 창을 닫은 뒤 본 창을 띄워도 된다.
+func runInstallSplash() error {
+	var sp *walk.MainWindow
+	if err := (MainWindow{
+		AssignTo: &sp,
+		Title:    "eprinter 준비 중",
+		MinSize:  Size{Width: 380, Height: 120},
+		Size:     Size{Width: 380, Height: 120},
+		Layout:   VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}},
+		Children: []Widget{
+			Label{Text: "가상 프린터 \"eprinter\" 를 설치하는 중입니다…"},
+			Label{Text: "잠시만 기다려 주세요."},
+		},
+	}).Create(); err != nil {
+		// 로딩창을 만들지 못하면 그냥 설치만 한다.
+		return vprinter.Install()
 	}
 
-	if !vprinter.IsAdmin() {
-		vpLabel.SetText("비활성 — 관리자 권한이 없어 가상 프린터를 설치하지 못했습니다 (수동 변환만 가능)")
-		return
-	}
-
-	if err := vprinter.Install(); err != nil {
-		vpLabel.SetText("설치 실패 — 수동 변환만 가능")
-		walk.MsgBox(mw, "가상 프린터 설치 실패", err.Error(), walk.MsgBoxIconWarning)
-		return
-	}
-	vpLabel.SetText(fmt.Sprintf("활성 — \"%s\" 로 인쇄하면 자동으로 PDF 저장됩니다", vprinter.PrinterName))
-
-	// 스풀 감시 시작.
-	watcher.Convert = func(in, out string) error {
-		return eng.Convert(context.Background(), engine.ConvertOptions{
-			Input: in, Output: out, Kind: engine.OutPDF,
-		})
-	}
-	watcher.OnEvent = appendLog
-	go watcher.Run()
-
-	// 종료 시 정리.
-	mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		watcher.Stop()
-		_ = vprinter.Remove()
+	// 설치가 끝나기 전에는 사용자가 로딩창을 닫지 못하게 막는다.
+	// (조기 닫힘 시 sp.Run 이 먼저 반환하면서 정리/신호 순서가 꼬이는 레이스를 원천 차단)
+	// installing 은 UI 스레드에서만 읽고 쓴다(Closing 핸들러, 그리고 아래 Synchronize 콜백).
+	installing := true
+	sp.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+		if installing {
+			*canceled = true
+		}
 	})
+
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("설치 중 오류: %v", r)
+			}
+			// 먼저 로딩창 정리를 큐에 넣어 sp 접근을 끝낸 뒤에 완료를 신호한다.
+			sp.Synchronize(func() {
+				installing = false
+				sp.Close()
+			})
+			done <- err
+		}()
+		err = vprinter.Install()
+	}()
+
+	sp.Run() // 설치가 끝나 sp.Close() 가 불릴 때까지 메시지 루프를 돌린다.
+	return <-done
 }
 
 // defaultSaveDir 은 자동 저장 폴더 기본값(바탕화면 → 사용자 폴더)을 반환한다.
@@ -219,95 +194,16 @@ func folderDialog(owner walk.Form, current string) string {
 	return ""
 }
 
-func doConvert(mw *walk.MainWindow, eng engine.Engines, in, out string, setStatus func(string, ...interface{})) {
-	if in == "" {
-		walk.MsgBox(mw, "확인", "입력 문서를 먼저 선택하세요.", walk.MsgBoxIconWarning)
-		return
+// engineStatus 는 내장 엔진 사용 가능 여부를 짧은 한 줄로 표시한다.
+func engineStatus(eng engine.Engines) string {
+	switch {
+	case eng.Ghostscript != "" && eng.GhostPCL != "":
+		return "사용 가능 ✓ (Ghostscript + GhostPCL 내장)"
+	case eng.Ghostscript == "" && eng.GhostPCL == "":
+		return "엔진 미탐지 ✗"
+	case eng.Ghostscript == "":
+		return "GhostPCL만 사용 가능 (Ghostscript 미탐지)"
+	default:
+		return "Ghostscript만 사용 가능 (GhostPCL 미탐지)"
 	}
-	if out == "" {
-		walk.MsgBox(mw, "확인", "PDF 저장 경로/파일명을 지정하세요.", walk.MsgBoxIconWarning)
-		return
-	}
-	if !strings.EqualFold(filepath.Ext(out), ".pdf") {
-		out += ".pdf"
-	}
-	setStatus("변환 중…")
-	err := eng.Convert(context.Background(), engine.ConvertOptions{
-		Input: in, Output: out, Kind: engine.OutPDF,
-	})
-	if err != nil {
-		setStatus("실패")
-		walk.MsgBox(mw, "변환 실패", err.Error(), walk.MsgBoxIconError)
-		return
-	}
-	setStatus("완료: %s", out)
-	walk.MsgBox(mw, "완료", "PDF로 저장했습니다:\n"+out, walk.MsgBoxIconInformation)
-}
-
-func doPrint(mw *walk.MainWindow, eng engine.Engines, in, printer string, setStatus func(string, ...interface{})) {
-	if in == "" {
-		walk.MsgBox(mw, "확인", "입력 문서를 먼저 선택하세요.", walk.MsgBoxIconWarning)
-		return
-	}
-	if printer == "" || strings.HasPrefix(printer, "(") {
-		walk.MsgBox(mw, "확인", "사용할 프린터를 선택하세요.", walk.MsgBoxIconWarning)
-		return
-	}
-	setStatus("인쇄 중… (%s)", printer)
-	err := eng.Print(context.Background(), engine.PrintOptions{
-		Input: in, Printer: printer, Copies: 1,
-	})
-	if err != nil {
-		setStatus("인쇄 실패")
-		walk.MsgBox(mw, "인쇄 실패", err.Error(), walk.MsgBoxIconError)
-		return
-	}
-	setStatus("인쇄 전송 완료: %s", printer)
-}
-
-func loadPrinters() []string {
-	names, err := engine.ListPrinters(context.Background())
-	if err != nil || len(names) == 0 {
-		return []string{"(프린터 없음)"}
-	}
-	return names
-}
-
-func openDialog(owner walk.Form) string {
-	dlg := &walk.FileDialog{
-		Title:  "입력 문서 선택",
-		Filter: "지원 문서 (*.pdf;*.ps;*.eps;*.pcl;*.pxl)|*.pdf;*.ps;*.eps;*.pcl;*.pxl|모든 파일 (*.*)|*.*",
-	}
-	if ok, _ := dlg.ShowOpen(owner); ok {
-		return dlg.FilePath
-	}
-	return ""
-}
-
-func saveDialog(owner walk.Form, current string) string {
-	dlg := &walk.FileDialog{
-		Title:    "PDF 저장",
-		Filter:   "PDF 파일 (*.pdf)|*.pdf",
-		FilePath: current,
-	}
-	if ok, _ := dlg.ShowSave(owner); ok {
-		p := dlg.FilePath
-		if !strings.EqualFold(filepath.Ext(p), ".pdf") {
-			p += ".pdf"
-		}
-		return p
-	}
-	return ""
-}
-
-func suggestPDF(in string) string {
-	ext := filepath.Ext(in)
-	return strings.TrimSuffix(in, ext) + ".pdf"
-}
-
-func pathOrMissing(s string) string {
-	if s == "" {
-		return "(미탐지)"
-	}
-	return s
 }
