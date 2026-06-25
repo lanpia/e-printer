@@ -176,6 +176,7 @@ func insertPagePattern(out string) string {
 // run 은 외부 프로세스를 실행하고 표준출력/에러를 그대로 전달한다.
 func run(ctx context.Context, bin string, args []string) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
+	hideConsole(cmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

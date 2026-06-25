@@ -2,87 +2,106 @@ package vprinter
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// ConvertFunc 는 스풀 파일(in)을 PDF(out)로 변환하는 함수이다.
-type ConvertFunc func(in, out string) error
+// tcpHost 는 가상 프린터(Standard TCP/IP 포트)가 가리키는 주소이다.
+// 항상 루프백 — 인쇄 데이터는 이 PC 안에서만 오간다.
+const tcpHost = "127.0.0.1"
 
-// Watcher 는 포트 파일을 감시하다가 새 인쇄 작업이 떨어지면 PDF 로 변환한다.
-type Watcher struct {
-	OutputDir string      // PDF 자동 저장 폴더
-	Convert   ConvertFunc // 변환 콜백 (보통 engine.Convert 래핑)
-	OnEvent   func(msg string)
-	Interval  time.Duration // 0이면 800ms
+// TCPPort 는 가상 프린터와 로컬 리스너가 함께 쓰는 포트이다.
+// 기본 9100(RAW 인쇄 표준). 환경변수 EPRINTER_TCP_PORT 로 바꿀 수 있다.
+func TCPPort() int {
+	if v := strings.TrimSpace(os.Getenv("EPRINTER_TCP_PORT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
+			return n
+		}
+	}
+	return 9100
+}
 
+// ListenAddr 는 리스너가 바인딩할 주소("127.0.0.1:9100")이다.
+func ListenAddr() string { return fmt.Sprintf("%s:%d", tcpHost, TCPPort()) }
+
+// SaveFunc 는 한 인쇄 작업의 원시 데이터(data)를 out 경로의 PDF 로 저장한다.
+// data 는 드라이버가 보낸 그대로다(Microsoft Print To PDF → 이미 PDF).
+type SaveFunc func(data []byte, out string) error
+
+// Server 는 가상 프린터의 TCP/IP 포트로 들어오는 인쇄 작업을 받아 PDF 로 저장한다.
+// 인쇄 1건 = TCP 연결 1개. 연결이 닫히면(EOF) 한 작업의 데이터가 끝난 것이다.
+type Server struct {
+	OutputDir string  // PDF 자동 저장 폴더
+	Save      SaveFunc // 작업 저장 콜백
+	OnEvent   func(string)
+
+	ln   net.Listener
 	stop chan struct{}
 }
 
-// Stop 은 감시 루프를 종료시킨다.
-func (w *Watcher) Stop() {
-	if w.stop != nil {
-		close(w.stop)
+func (s *Server) emit(format string, a ...interface{}) {
+	if s.OnEvent != nil {
+		s.OnEvent(fmt.Sprintf(format, a...))
 	}
 }
 
-func (w *Watcher) emit(format string, a ...interface{}) {
-	if w.OnEvent != nil {
-		w.OnEvent(fmt.Sprintf(format, a...))
+// Start 는 로컬 TCP 리스너를 띄운다(논블로킹, 별도 고루틴에서 수신).
+func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", ListenAddr())
+	if err != nil {
+		return fmt.Errorf("TCP 리스너(%s) 시작 실패: %w", ListenAddr(), err)
+	}
+	s.ln = ln
+	s.stop = make(chan struct{})
+	go s.acceptLoop()
+	return nil
+}
+
+// Stop 은 리스너를 종료한다.
+func (s *Server) Stop() {
+	if s.stop != nil {
+		close(s.stop)
+	}
+	if s.ln != nil {
+		_ = s.ln.Close()
 	}
 }
 
-// Run 은 감시 루프를 시작한다(블로킹). 별도 고루틴에서 호출할 것.
-func (w *Watcher) Run() {
-	if w.Interval <= 0 {
-		// 로컬 포트 파일은 인쇄 완료 후 스풀러가 약 1초 만에 삭제하므로
-		// 그 짧은 창 안에 가로채려면 빠르게 폴링해야 한다.
-		w.Interval = 200 * time.Millisecond
-	}
-	w.stop = make(chan struct{})
-	port := PortFile()
-	var lastSize int64 = -1
-
-	ticker := time.NewTicker(w.Interval)
-	defer ticker.Stop()
-
+func (s *Server) acceptLoop() {
 	for {
-		select {
-		case <-w.stop:
-			return
-		case <-ticker.C:
+		conn, err := s.ln.Accept()
+		if err != nil {
+			select {
+			case <-s.stop:
+				return // 정상 종료
+			default:
+				continue
+			}
 		}
-
-		fi, err := os.Stat(port)
-		if err != nil || fi.Size() == 0 {
-			lastSize = -1
-			continue
-		}
-		// 두 번 연속 같은 크기일 때만(쓰기 완료 추정) 처리한다.
-		if fi.Size() != lastSize {
-			lastSize = fi.Size()
-			continue
-		}
-		lastSize = -1
-
-		// 포트 파일을 처리용 이름으로 가로채기(원자적 rename). 잠겨 있으면 다음 틱에 재시도.
-		job := filepath.Join(SpoolDir(), "job-"+time.Now().Format("20060102_150405.000")+".ps")
-		if err := os.Rename(port, job); err != nil {
-			continue
-		}
-
-		out := uniqueName(w.OutputDir, time.Now())
-		w.emit("인쇄 작업 감지 → 변환 중…")
-		if err := w.Convert(job, out); err != nil {
-			bad := job + ".err"
-			os.Rename(job, bad)
-			w.emit("변환 실패: %v (원본 보관: %s)", err, bad)
-			continue
-		}
-		os.Remove(job)
-		w.emit("PDF 저장 완료: %s", out)
+		go s.handle(conn)
 	}
+}
+
+func (s *Server) handle(conn net.Conn) {
+	defer conn.Close()
+	data, err := io.ReadAll(conn) // 연결이 닫힐 때까지 = 한 작업 전체
+	if err != nil || len(data) == 0 {
+		return
+	}
+	s.emit("인쇄 작업 수신 → 저장 중…")
+	out := uniqueName(s.OutputDir, time.Now())
+	if s.Save != nil {
+		if err := s.Save(data, out); err != nil {
+			s.emit("저장 실패: %v", err)
+			return
+		}
+	}
+	s.emit("PDF 저장 완료: %s", out)
 }
 
 // uniqueName 은 저장 폴더에서 충돌하지 않는 PDF 경로를 만든다.

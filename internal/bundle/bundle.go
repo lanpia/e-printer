@@ -54,17 +54,29 @@ func Ensure() (Paths, error) {
 	return p, nil
 }
 
-// 캐시 루트: %LOCALAPPDATA%\eprinter\<버전>
-func cacheRoot() (string, error) {
+// cacheBase 는 캐시 루트의 부모(%LOCALAPPDATA%\eprinter)이다.
+func cacheBase() string {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		base = os.TempDir()
 	}
-	root := filepath.Join(base, "eprinter", bundleVersion)
+	return filepath.Join(base, "eprinter")
+}
+
+// 캐시 루트: %LOCALAPPDATA%\eprinter\<버전>
+func cacheRoot() (string, error) {
+	root := filepath.Join(cacheBase(), bundleVersion)
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", err
 	}
 	return root, nil
+}
+
+// RemoveCache 는 추출된 엔진 캐시 전체(모든 버전)를 삭제한다.
+// 종료 시 원복(흔적 제거)용. 다음 실행 때 다시 추출된다.
+// 사용 중인 gs.exe 가 있으면 일부 파일이 잠겨 삭제가 부분 실패할 수 있으나 best-effort.
+func RemoveCache() error {
+	return os.RemoveAll(cacheBase())
 }
 
 // 임베드 zip 을 root 아래로 전부 푼다(경로 탈출 방지).

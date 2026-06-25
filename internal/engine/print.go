@@ -70,6 +70,7 @@ func ListPrinters(ctx context.Context) ([]string, error) {
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive",
 		"-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "+
 			"Get-Printer | Select-Object -ExpandProperty Name")
+	hideConsole(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("프린터 목록 조회 실패: %w", err)

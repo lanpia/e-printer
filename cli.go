@@ -55,7 +55,8 @@ func cmdInstallPrinter() error {
 	if err := vprinter.Install(); err != nil {
 		return err
 	}
-	fmt.Printf("가상 프린터 설치 완료: %q\n포트 파일: %s\n", vprinter.PrinterName, vprinter.PortFile())
+	fmt.Printf("가상 프린터 설치 완료: %q\nTCP/IP 포트: %s (인쇄 데이터를 받으려면 GUI 의 리스너가 떠 있어야 함)\n",
+		vprinter.PrinterName, vprinter.ListenAddr())
 	return nil
 }
 
